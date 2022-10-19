@@ -207,7 +207,7 @@ if (!$Sender -and !$Subject -and !$Content) {
                 $delete = $AutoDelete; # If AutoDelete is set, no further user input is required.
 
                 Write-Host "---------- E-Mails to delete ---------------------------------------------"
-                $entries | ForEach-Object { [PSCustomObject]$_ } | Format-Table -AutoSize; # https://stackoverflow.com/a/20874563
+                $entries | ForEach-Object { [PSCustomObject]$_ } | Select-Object -Property "Received Time", Sender, Subject, Location | Sort-Object -Property Location | Format-Table -AutoSize; # https://stackoverflow.com/a/20874563
 
                 # If auto-deletion is deactivated, ask for permission.
                 if (!$delete) {
