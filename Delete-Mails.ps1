@@ -21,7 +21,7 @@ param(
     )][string]$Subject,
     [Parameter(
         Mandatory = $false,
-        HelpMessage = "Mail Content"
+        HelpMessage = "Mail Content (does not remove mails from mailboxes but adds a new filter for incoming mails)"
     )][string]$Content,
     [Parameter(
         Mandatory = $false,
@@ -71,9 +71,11 @@ if (!$Sender -and !$Subject -and !$Content) {
         # Check if sender is a valid mail address (regex from https://www.undocumented-features.com/2021/04/23/easy-powershell-email-address-validation-function/#Solution).
         if ($Sender -match "^\w+([-+.']\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*$") {
             if (!$BlockSender) {
-                Write-Warning "The sender seems to be a valid mail address. Do you want to add it to the block list?"
+                $MESSAGE = "${Sender} seems to be a valid mail address. Do you want to add it to the block list?";
+
+                Write-Warning $MESSAGE;
                 $choicesAdd = [System.Management.Automation.Host.ChoiceDescription[]]("&no", "&yes");
-                $BlockSender = $host.UI.PromptForChoice("Add?", "${Sender} seems to be a valid mail address. Do you want to add it to the block list?", $choicesAdd, 0);
+                $BlockSender = $host.UI.PromptForChoice("Add?", "${MESSAGE}", $choicesAdd, 0);
             }
         }
 
@@ -86,7 +88,7 @@ if (!$Sender -and !$Subject -and !$Content) {
 
         # Add sender to block list if desired.
         if ($BlockSender) {
-            $MAILFLOW_RULE_NAME = "Phishing (Powershell managed)";
+            $MAILFLOW_RULE_NAME = "Phishing/Spam (Powershell managed) - sender-based";
 
             # Try to get the phishing transport rule.
             $rule = Get-TransportRule | Where-Object { $_.Name -eq "${MAILFLOW_RULE_NAME}" };
@@ -103,136 +105,165 @@ if (!$Sender -and !$Subject -and !$Content) {
             }
         }
 
-        # Connect to Security & Compliance Center.
-        if ($Credential) {
-            Connect-IPPSSession -Credential $Credential | Out-Null;
-        } else {
-            Connect-IPPSSession | Out-Null;
-        }
+        # Add body pattern to block list if desired.
+        if ($Content) {
+            $MAILFLOW_RULE_NAME = "Phishing/Spam (Powershell managed) - body-based";
 
-        # Try to get a search with the unique search name
-        $complianceSearch = Get-ComplianceSearch | Where-Object { $_.Name -eq "${COMPLIANCE_SEARCH_NAME}" };
-        
-        # If previous search was found, delete it
-        if ($complianceSearch) {
-            Remove-ComplianceSearch -Identity "${COMPLIANCE_SEARCH_NAME}" -Confirm:$false;
-        }
+            # Try to get the phishing transport rule.
+            $rule = Get-TransportRule | Where-Object { $_.Name -eq "${MAILFLOW_RULE_NAME}" };
 
-        $parameters = @{
-            'From' = "$Sender";
-            'Subject' = "$Subject";
-            'Message' = "$Content";
-        }
-        $query = "";
+            $bodyPatterns = New-Object System.Collections.ArrayList;
+            $bodyPatterns.Add($Content) | Out-Null;
 
-        Write-Host "Creating new compliance search.";
-        ForEach ($key in $parameters.Keys) {
-            $value = $parameters[$key];
-
-            if ($value) {
-                if ($query) {
-                    $query += " AND "; # Concatenating query conditions.
-                }
-                $query += "(${key}:`"${value}`")";
+            # If not existent yet, create the rule.
+            if (!$rule) {
+                New-TransportRule -Name "${MAILFLOW_RULE_NAME}" -Quarantine $true -SetAuditSeverity "High" -SubjectOrBodyMatchesPatterns $bodyPatterns.ToArray() -ExceptIfSubjectMatchesPatterns $bodyPatterns.ToArray() | Out-Null;
+            } else {
+                $bodyPatterns.AddRange($rule.SubjectOrBodyMatchesPatterns);
+                Set-TransportRule -Identity $rule.Identity -SubjectOrBodyMatchesPatterns ($bodyPatterns.ToArray() | Select-Object -Unique) | Out-Null;
             }
         }
-        $complianceSearch = New-ComplianceSearch -Name "${COMPLIANCE_SEARCH_NAME}" -ExchangeLocation All -ContentMatchQuery "${query}";
 
-        # Start compliance search.
-        Start-ComplianceSearch -Identity $complianceSearch.Identity;
-
-        # Wait until the search completed.
-        Write-Host "Executing search...";
-        while (($searchResult = (Get-ComplianceSearch -Identity "${COMPLIANCE_SEARCH_NAME}")) -and $searchResult.status -ne "Error" -and $searchResult.status -ne "Completed") {
-            # Wait until the search completed.
-            Start-Sleep -Seconds 1;
-        }
-        $previewAction = New-ComplianceSearchAction -SearchName "${COMPLIANCE_SEARCH_NAME}" -Preview;
-
-        Write-Host "Waiting for results...";
-        Wait-ForActionCompletion -Identity $previewAction.Identity;
-
-        # Get results.
-        $actionResults = Get-ComplianceSearchAction -Identity $previewAction.Identity -Details;
-
-        # Clean result string.
-        $resultString = ($actionResults.Results.TrimStart('{').TrimEnd('}'));
-
-        if ($resultString) {
-            $entries = New-Object System.Collections.ArrayList;
-
-            # Usually, the returned result looks something like this:
-            # {Location: max.mustermann@company.com; Sender: max.mustermann@company.com; Subject: Suchtest mit Sonderzeichen ; , :; Type: Email; Size: 47955; Received Time: 31.03.2022 08:01:00; Data Link: PreviewResults/Exchange/item_4TsMpFu3af28FLqPkAAIsVmIYAAA==/item.eml,
-            # Location: max.mustermann@company.com; Sender: max.mustermann@company.com; Subject: Suchtest; Type: Email; Size: 53378; Received Time: 31.03.2022 07:57:00; Data Link: PreviewResults/Exchange/item_4TsMpFu3af28FLqPkAAIsVmHsAAA==/item.eml}
-            #
-            # The first step therefore, is to trim the brackets at the start and the end, split the lines into an array and remove the trailing comma.
-
-            # Separate result lines.
-            $results = $resultString -split '\n' | ForEach-Object { $_.TrimStart().TrimEnd().TrimEnd(',') };
-
-            # Map result properties.
-            foreach ($result in $results) {
-                # Each line is matched by a Regex to get properties and values. In the case of "Location: max.mustermann@company.com; Sender: max.mustermann@company.com; Subject: Suchtest; Type: Email;...
-                # this leads to:
-                # Location: 
-                # ; Sender: 
-                # ; Subject:
-                # and to on...
-                $keysRegex = [regex]"(^|; )(\w+ ?\w+): ";
-
-                # The result is split at the property names, which returns an array from which the property
-                # names and the corresponding values can be mapped together. E.g.
-                #
-                #
-                # Location
-                # max.mustermann@company.com
-                # ;
-                # Sender
-                # max.mustermann@company.com
-                # ;
-                # Subject
-                # Suchtest
-                $values = $keysRegex.Split("$result") | Where-Object { $_.Trim() -ne "" };
-                $mapping = @{};
-                
-                # Map properties to values
-                for ($i = 0; $i -lt $values.Length; $i += 3) {
-                    $mapping[$values[$i]] = $values[$i + 1];
-                }
-                $entries.Add($mapping) | Out-Null;
+        # Create search only of Sender or Subject was provided.
+        if ($Sender -or $Subject) {
+            # Connect to Security & Compliance Center.
+            if ($Credential) {
+                Connect-IPPSSession -Credential $Credential | Out-Null;
+            } else {
+                Connect-IPPSSession | Out-Null;
             }
+
+            # Try to get a search with the unique search name
+            $complianceSearch = Get-ComplianceSearch | Where-Object { $_.Name -eq "${COMPLIANCE_SEARCH_NAME}" };
             
-            # Check if results were found.
-            if ($entries.Count -gt 0) {
-                $delete = $AutoDelete; # If AutoDelete is set, no further user input is required.
+            # If previous search was found, delete it
+            if ($complianceSearch) {
+                Remove-ComplianceSearch -Identity "${COMPLIANCE_SEARCH_NAME}" -Confirm:$false;
+            }
 
-                Write-Host "---------- E-Mails to delete ---------------------------------------------"
-                $entries | ForEach-Object { [PSCustomObject]$_ } | Select-Object -Property "Received Time", Sender, Subject, Location | Sort-Object -Property Location | Format-Table -AutoSize; # https://stackoverflow.com/a/20874563
+            $parameters = @{
+                'From' = "$Sender";
+                'Subject' = "$Subject";
+            }
+            $query = "";
 
-                # If auto-deletion is deactivated, ask for permission.
-                if (!$delete) {
-                    $choicesDelete = [System.Management.Automation.Host.ChoiceDescription[]]("&no", "&yes");
-                    $choice = $host.UI.PromptForChoice("Confirmation", "Are you sure you want to delete $($entries.Count) e-mails?", $choicesDelete, 0);
+            Write-Host "Creating new compliance search.";
+            ForEach ($key in $parameters.Keys) {
+                $value = $parameters[$key];
 
-                    if ($choice -eq 1) {
-                        $delete = $true;
+                if ($value) {
+                    if ($query) {
+                        $query += " AND "; # Concatenating query conditions.
                     }
+                    $query += "(${key}:`"${value}`")";
                 }
+            }
+            $query;
+            $complianceSearch = New-ComplianceSearch -Name "${COMPLIANCE_SEARCH_NAME}" -ExchangeLocation All -ContentMatchQuery "${query}";
 
-                # Delete or abort.
-                if ($delete) {
-                    $purgeAction = New-ComplianceSearchAction -SearchName "${COMPLIANCE_SEARCH_NAME}" -Purge -PurgeType HardDelete -Force -Confirm:$false;
+            # Start compliance search.
+            Start-ComplianceSearch -Identity $complianceSearch.Identity;
 
-                    Write-Host "Deleting mails...";
-                    Wait-ForActionCompletion -Identity $purgeAction.Identity;
+            # Wait until the search completed.
+            Write-Host "Executing search...";
+            while (($searchResult = (Get-ComplianceSearch -Identity "${COMPLIANCE_SEARCH_NAME}")) -and $searchResult.status -ne "Error" -and $searchResult.status -ne "Completed") {
+                # Wait until the search completed.
+                Start-Sleep -Seconds 1;
+            }
+            $previewAction = New-ComplianceSearchAction -SearchName "${COMPLIANCE_SEARCH_NAME}" -Preview;
+
+            Write-Host "Waiting for results...";
+            Wait-ForActionCompletion -Identity $previewAction.Identity;
+
+            # Get results.
+            $actionResults = Get-ComplianceSearchAction -Identity $previewAction.Identity -Details;
+
+            # Clean result string.
+            $resultString = ($actionResults.Results.TrimStart('{').TrimEnd('}'));
+
+            if ($resultString) {
+                $entries = New-Object System.Collections.ArrayList;
+
+                # Usually, the returned result looks something like this:
+                # {Location: max.mustermann@company.com; Sender: max.mustermann@company.com; Subject: Suchtest mit Sonderzeichen ; , :; Type: Email; Size: 47955; Received Time: 31.03.2022 08:01:00; Data Link: PreviewResults/Exchange/item_4TsMpFu3af28FLqPkAAIsVmIYAAA==/item.eml,
+                # Location: max.mustermann@company.com; Sender: max.mustermann@company.com; Subject: Suchtest; Type: Email; Size: 53378; Received Time: 31.03.2022 07:57:00; Data Link: PreviewResults/Exchange/item_4TsMpFu3af28FLqPkAAIsVmHsAAA==/item.eml}
+                #
+                # The first step therefore, is to trim the brackets at the start and the end, split the lines into an array and remove the trailing comma.
+
+                # Separate result lines.
+                $results = $resultString -split '\n' | ForEach-Object { $_.TrimStart().TrimEnd().TrimEnd(',') };
+
+                # Map result properties.
+                foreach ($result in $results) {
+                    # Each line is matched by a Regex to get properties and values. In the case of "Location: max.mustermann@company.com; Sender: max.mustermann@company.com; Subject: Suchtest; Type: Email;...
+                    # this leads to:
+                    # Location: 
+                    # ; Sender: 
+                    # ; Subject:
+                    # and to on...
+                    $keysRegex = [regex]"(^|; )(\w+ ?\w+): ";
+
+                    # The result is split at the property names, which returns an array from which the property
+                    # names and the corresponding values can be mapped together. E.g.
+                    #
+                    #
+                    # Location
+                    # max.mustermann@company.com
+                    # ;
+                    # Sender
+                    # max.mustermann@company.com
+                    # ;
+                    # Subject
+                    # Suchtest
+                    $values = $keysRegex.Split("$result") | Where-Object { $_.Trim() -ne "" };
+                    $mapping = @{};
+                    
+                    # Map properties to values
+                    for ($i = 0; $i -lt $values.Length; $i += 3) {
+                        $mapping[$values[$i]] = $values[$i + 1];
+                    }
+                    $entries.Add($mapping) | Out-Null;
+                }
+                
+                # Check if results were found.
+                if ($entries.Count -gt 0) {
+                    $delete = $AutoDelete; # If AutoDelete is set, no further user input is required.
+
+                    Write-Host "---------- E-Mails to delete ---------------------------------------------"
+                    $entries | ForEach-Object { [PSCustomObject]$_ } | Select-Object -Property "Received Time", Sender, Subject, Location | Sort-Object -Property Location | Format-Table -AutoSize; # https://stackoverflow.com/a/20874563
+
+                    # If auto-deletion is deactivated, ask for permission.
+                    if (!$delete) {
+                        $choicesDelete = [System.Management.Automation.Host.ChoiceDescription[]]("&no", "&yes");
+                        $choice = $host.UI.PromptForChoice("Confirmation", "Are you sure you want to delete $($entries.Count) e-mails?", $choicesDelete, 0);
+
+                        if ($choice -eq 1) {
+                            $delete = $true;
+                        }
+                    }
+
+                    # Delete or abort.
+                    if ($delete) {
+                        $purgeAction = New-ComplianceSearchAction -SearchName "${COMPLIANCE_SEARCH_NAME}" -Purge -PurgeType HardDelete -Force -Confirm:$false;
+
+                        Write-Host "Deleting mails...";
+                        Wait-ForActionCompletion -Identity $purgeAction.Identity;
+                    } else {
+                        Write-Warning "Deletion aborted!";
+                    }
                 } else {
-                    Write-Warning "Deletion aborted!";
+                    Write-Warning "No e-mails found. Process has been aborted.";
                 }
             } else {
-                Write-Warning "No e-mails found. Process has been aborted.";
+                Write-Warning "No results received.";
             }
         } else {
-            Write-Warning "No results received.";
+            $addition = "";
+
+            if ($Content) {
+                $addition = ". However, future mails with the pattern '${Content}' will be put into quarantine";
+            }
+            Write-Host "No Sender or Subject was provided, no mails will be deleted${addition}.";
         }
     } catch {
         Write-Error $_;
