@@ -9,7 +9,7 @@ If this Cmdlet doesn't work or you get errors like "A parameter cannot be found 
 |--------------|---------------------------------------------------------------------------------------------------------------------------------------|
 | -Sender      | Mail Sender                                                                                                                           |
 | -Subject     | Mail Subject                                                                                                                          |
-| -Content     | Mail Content                                                                                                                          |
+| -Content     | Mail Content **(does not remove mails from mailboxes but adds a new filter for incoming mails)**                                      |
 | -BlockSender | If the parameter -Sender contains a valid mail address he is automatically added to the Phishing mail flow list to avoid future mails |
 | -Credential  | Credential to login without user interaction (does not work, if MFA is active)                                                        |
 | -AutoDelete  | Delete mails without asking **(USE ONLY, IF YOU KNOW EXACTLY WHAT YOU ARE DOING!)**                                                   |
