@@ -158,7 +158,6 @@ if (!$Sender -and !$Subject -and !$Content) {
                     $query += "(${key}:`"${value}`")";
                 }
             }
-            $query;
             $complianceSearch = New-ComplianceSearch -Name "${COMPLIANCE_SEARCH_NAME}" -ExchangeLocation All -ContentMatchQuery "${query}";
 
             # Start compliance search.
